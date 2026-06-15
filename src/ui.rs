@@ -10,21 +10,18 @@ use crate::app::{AddStep, App, Focus, Modal, MsgLevel};
 
 // ─── Color Palette ─────────────────────────────────────────────────────
 
-/// A clean, minimal color scheme using indexed terminal colors.
 mod color {
     use ratatui::style::Color;
 
+    pub const BG: Color = Color::Black;
     pub const SELECTED_BG: Color = Color::Blue;
     pub const SELECTED_FG: Color = Color::White;
     pub const BORDER: Color = Color::DarkGray;
     pub const BORDER_FOCUS: Color = Color::Cyan;
     pub const TEXT_MUTED: Color = Color::DarkGray;
-    pub const STATUS_BG: Color = Color::DarkGray;
-    pub const STATUS_FG: Color = Color::White;
     pub const ACCENT: Color = Color::Cyan;
     pub const ERROR: Color = Color::Red;
     pub const SUCCESS: Color = Color::Green;
-    pub const OVERLAY_BG: Color = Color::Black;
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────
@@ -44,31 +41,49 @@ fn selected_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Truncate a string to max `n` characters, appending "…" if truncated.
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
+fn pane_block(title: &str, focused: bool, extra: &str) -> Block<'static> {
+    let title_text: String = if extra.is_empty() {
+        format!(" {title} ")
     } else {
-        format!("{}…", &s[..n.saturating_sub(1)])
-    }
+        format!(" {title}  {extra} ")
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style(focused))
+        .title(title_text)
+        .title_style(
+            if focused {
+                Style::default()
+                    .fg(color::BORDER_FOCUS)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color::TEXT_MUTED)
+            },
+        )
+}
+
+fn count_badge(count: usize) -> Span<'static> {
+    Span::styled(
+        format!("{}", count),
+        Style::default()
+            .fg(color::ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 // ─── Main Draw ─────────────────────────────────────────────────────────
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let chunks = Layout::vertical([
-        Constraint::Fill(1),    // main content
-        Constraint::Length(1),  // status bar
-    ])
-    .split(area);
+    let chunks =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
 
-    // Main content: three-pane layout
     let main = chunks[0];
     let panes = Layout::horizontal([
-        Constraint::Length(28),        // Projects
-        Constraint::Fill(1),           // Keys
-        Constraint::Length(30),        // Preview
+        Constraint::Length(28),
+        Constraint::Fill(1),
+        Constraint::Length(30),
     ])
     .split(main);
 
@@ -77,7 +92,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_preview(frame, panes[2], app);
     draw_status_bar(frame, chunks[1], app);
 
-    // Draw modal on top if active
     if app.modal.is_some() {
         draw_modal(frame, area, app);
     }
@@ -87,48 +101,37 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_project_list(frame: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Projects;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border_style(focused))
-        .title(" Projects ")
-        .title_style(if focused {
-            Style::default().fg(color::BORDER_FOCUS).add_modifier(Modifier::BOLD)
+    let extra = if !app.projects.is_empty() {
+        format!("{}", count_badge(app.projects.len()))
+    } else {
+        String::new()
+    };
+    let block = pane_block("Projects", focused, &extra);
+
+    let mut items = Vec::with_capacity(app.projects.len());
+    for (i, name) in app.projects.iter().enumerate() {
+        let is_selected = focused && app.selected_project == Some(i);
+        let is_active = app.selected_project == Some(i);
+
+        let prefix = if is_selected {
+            " \u{25C9} "
+        } else if is_active {
+            " \u{25CB} "
         } else {
-            Style::default().fg(color::TEXT_MUTED)
-        });
+            "   "
+        };
 
-    let _inner = block.inner(area);
+        let style = if is_selected {
+            selected_style()
+        } else {
+            Style::default()
+        };
 
-    let items: Vec<ListItem> = app
-        .projects
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let is_selected = focused && app.selected_project == Some(i);
-            let prefix = if focused && app.selected_project == Some(i) {
-                " ◉ "
-            } else if app.selected_project == Some(i) {
-                " ○ "
-            } else {
-                "   "
-            };
+        let content = Line::from(Span::styled(format!("{prefix}{name}"), style));
+        items.push(ListItem::new(content).style(style));
+    }
 
-            let content = Line::from(Span::styled(
-                format!("{}{}", prefix, name),
-                if is_selected { selected_style() } else { Style::default() },
-            ));
-
-            let item_style = if is_selected { selected_style() } else { Style::default() };
-            ListItem::new(content).style(item_style)
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(selected_style())
-        .highlight_symbol("");
-
+    let list = List::new(items).block(block).highlight_symbol("");
     frame.render_widget(list, area);
 }
 
@@ -136,51 +139,58 @@ fn draw_project_list(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_key_list(frame: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Keys;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(border_style(focused))
-        .title(" Keys ")
-        .title_style(if focused {
-            Style::default().fg(color::BORDER_FOCUS).add_modifier(Modifier::BOLD)
+    let loading = app.is_loading_values();
+
+    let extra = if !app.display_keys.is_empty() {
+        if loading {
+            format!("{}  ~", count_badge(app.display_keys.len()))
         } else {
-            Style::default().fg(color::TEXT_MUTED)
-        });
-
-    let project_name = app.selected_project_name().unwrap_or("");
-    let items: Vec<ListItem> = if !app.key_values.is_empty() {
-        app.key_values
-            .iter()
-            .enumerate()
-            .map(|(i, (key, val))| {
-                let is_selected = focused && app.selected_key == Some(i);
-                let obfuscated = if val.len() > 8 {
-                    format!("{}…{}", &val[..4], &val[val.len()-4..])
-                } else {
-                    val.clone()
-                };
-
-                let content = Line::from(vec![
-                    Span::styled(
-                        format!("  {}", key),
-                        if is_selected { selected_style() } else { Style::default() },
-                    ),
-                    Span::styled(
-                        format!("  {}", obfuscated),
-                        if is_selected { selected_style() } else {
-                            Style::default().fg(color::TEXT_MUTED)
-                        },
-                    ),
-                ]);
-
-                ListItem::new(content)
-            })
-            .collect()
+            format!("{}", count_badge(app.display_keys.len()))
+        }
     } else {
-        let msg = if project_name.is_empty() {
-            "Select a project"
-        } else {
-            "No secrets yet. Press [a] to add."
+        String::new()
+    };
+    let block = pane_block("Keys", focused, &extra);
+
+    let items: Vec<ListItem> = if loading && app.display_keys.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  \u{25CC} Loading...",
+            Style::default().fg(color::TEXT_MUTED),
+        )))]
+    } else if !app.display_keys.is_empty() {
+        let mut items = Vec::with_capacity(app.display_keys.len());
+        for (i, dk) in app.display_keys.iter().enumerate() {
+            let is_selected = focused && app.selected_key == Some(i);
+            let style = if is_selected {
+                selected_style()
+            } else {
+                Style::default()
+            };
+            let muted_style = if is_selected {
+                style
+            } else {
+                Style::default().fg(color::TEXT_MUTED)
+            };
+
+            let obfuscated = if loading && dk.obfuscated.is_empty() {
+                "\u{2014}".to_string()
+            } else if dk.obfuscated.is_empty() {
+                "(empty)".to_string()
+            } else {
+                dk.obfuscated.clone()
+            };
+
+            let content = Line::from(vec![
+                Span::styled(format!("  {}", dk.name), style),
+                Span::styled(format!("  {}", obfuscated), muted_style),
+            ]);
+            items.push(ListItem::new(content));
+        }
+        items
+    } else {
+        let msg = match app.selected_project_name() {
+            None => "\u{2190} Select a project",
+            Some(_) => "\u{2295} Press [a] to add",
         };
         vec![ListItem::new(Line::from(Span::styled(
             format!("  {}", msg),
@@ -195,57 +205,91 @@ fn draw_key_list(frame: &mut Frame, area: Rect, app: &App) {
 // ─── Preview (Right Pane) ──────────────────────────────────────────────
 
 fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(color::BORDER))
-        .title(" Preview ")
-        .title_style(Style::default().fg(color::TEXT_MUTED));
+    let block = pane_block("Preview", false, "");
+    let mut lines: Vec<Line> = Vec::with_capacity(6);
 
-    let _inner = block.inner(area);
-
-    let mut lines = Vec::new();
-
-    if app.focus == Focus::Keys {
+    if app.focus == Focus::Keys || app.selected_key.is_some() {
         if let Some(i) = app.selected_key {
-            if let Some((key, val)) = app.key_values.get(i) {
-                lines.push(Line::from(Span::styled(
-                    key.as_str(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
+            if let Some(dk) = app.display_keys.get(i) {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    val.as_str(),
-                    Style::default(),
+                    &dk.name,
+                    Style::default()
+                        .fg(color::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(""));
+
+                let val_preview = if dk.full_value.is_empty() && app.is_loading_values() {
+                    "  loading...".to_string()
+                } else if dk.full_value.is_empty() {
+                    "  (empty)".to_string()
+                } else if dk.full_value.len() > 200 {
+                    format!("  {}...", &dk.full_value[..200])
+                } else {
+                    format!("  {}", dk.full_value)
+                };
+                lines.push(Line::from(Span::styled(val_preview, Style::default())));
+                lines.push(Line::from(""));
+
+                let char_count = dk.full_value.chars().count();
+                lines.push(Line::from(Span::styled(
+                    format!("  \u{2A} {} chars", char_count),
+                    Style::default().fg(color::TEXT_MUTED),
                 )));
             }
         }
     }
 
-    if let Some((ref name, _)) = app.selected_project_name().map(|n| (n, ())) {
-        if lines.is_empty() {
+    if lines.is_empty() {
+        if let Some(name) = app.selected_project_name() {
+            if app.keys.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", name),
+                    Style::default()
+                        .fg(color::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  \u{2139} No secrets yet",
+                    Style::default().fg(color::TEXT_MUTED),
+                )));
+            } else {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", name),
+                    Style::default()
+                        .fg(color::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {} key(s), {} loaded",
+                        app.keys.len(),
+                        app.key_values.len()
+                    ),
+                    Style::default().fg(color::TEXT_MUTED),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  \u{2191}\u{2195} Select a key to preview",
+                    Style::default().fg(color::TEXT_MUTED),
+                )));
+            }
+        } else {
+            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                format!("Project: {}", name),
-                Style::default().add_modifier(Modifier::BOLD),
+                "  \u{2190} Select a project",
+                Style::default().fg(color::TEXT_MUTED),
             )));
-            let key_count = app.keys.len();
-            lines.push(Line::from(format!("{} secret(s)", key_count)));
         }
     }
 
-    let text = if lines.is_empty() {
-        Text::from(Line::from(Span::styled(
-            "  Select a key to preview",
-            Style::default().fg(color::TEXT_MUTED),
-        )))
-    } else {
-        Text::from(lines)
-    };
-
-    let p = Paragraph::new(text)
-        .block(block)
-        .wrap(Wrap { trim: false });
-
+    let text = Text::from(lines);
+    let p = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
     frame.render_widget(p, area);
 }
 
@@ -254,7 +298,7 @@ fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let (msg, msg_style) = if let Some((ref text, level)) = app.status_msg {
         let style = match level {
-            MsgLevel::Info => Style::default().fg(color::STATUS_FG),
+            MsgLevel::Info => Style::default().fg(color::ACCENT),
             MsgLevel::Success => Style::default().fg(color::SUCCESS),
             MsgLevel::Error => Style::default().fg(color::ERROR),
         };
@@ -263,79 +307,63 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         (String::new(), Style::default())
     };
 
+    let loading = app.is_loading_values();
     let copied = if app.copied.is_some() {
-        " ● Copied! "
+        " \u{25CF} Copied! "
     } else {
         ""
     };
 
     let focus_name = match app.focus {
-        Focus::Projects => "[Projects]",
-        Focus::Keys => "[Keys]",
+        Focus::Projects => " Projects ",
+        Focus::Keys => " Keys ",
     };
 
-    let keys = if app.focus == Focus::Keys && !app.key_values.is_empty() {
-        format!(
-            " ↑↓  a dd  c opy  d el  p rojects  q uit"
-        )
+    let loading_indicator = if loading { " \u{25CC} " } else { "" };
+
+    let key_hints = if app.focus == Focus::Keys && !app.display_keys.is_empty() {
+        " \u{2191}\u{2195}  a dd  c opy  d el  p rojects  q uit"
     } else {
-        format!(" ↑↓  a dd  c opy  q uit")
+        " \u{2191}\u{2195}  a dd  c opy  q uit"
     };
 
-    let pad = (area.width as usize)
-        .saturating_sub(focus_name.len() + 1 + msg.len() + copied.len() + keys.len() + 3);
-    let focus_str = format!(" {} ", focus_name);
-    let pad_str = " ".repeat(pad);
+    let rhs = format!("{copied}{loading_indicator}{key_hints}");
+    let fixed_len = focus_name.len() + 1 + msg.len();
+    let width = area.width as usize;
+    let pad = width.saturating_sub(fixed_len + rhs.len()).min(width);
+
     let bar = Line::from(vec![
         Span::styled(
-            &focus_str,
+            focus_name,
             Style::default()
                 .bg(color::ACCENT)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(" ", Style::default().bg(color::BG)),
+        Span::styled(&msg, msg_style.bg(color::BG)),
+        Span::styled(" ".repeat(pad), Style::default().bg(color::BG)),
         Span::styled(
-            " ",
-            Style::default().bg(color::STATUS_BG),
-        ),
-        Span::styled(
-            &msg,
-            msg_style.bg(color::STATUS_BG),
-        ),
-        Span::styled(
-            copied,
-            Style::default()
-                .bg(color::STATUS_BG)
-                .fg(color::SUCCESS)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            &pad_str,
-            Style::default().bg(color::STATUS_BG),
-        ),
-        Span::styled(
-            &keys,
-            Style::default()
-                .bg(color::STATUS_BG)
-                .fg(color::TEXT_MUTED),
+            &rhs,
+            Style::default().bg(color::BG).fg(color::TEXT_MUTED),
         ),
     ]);
 
-    let p = Paragraph::new(bar).style(Style::default().bg(color::STATUS_BG));
+    let p = Paragraph::new(bar).style(Style::default().bg(color::BG));
     frame.render_widget(p, area);
 }
 
 // ─── Modal Overlay ────────────────────────────────────────────────────
 
 fn draw_modal(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(ref modal) = app.modal else { return };
+    let Some(ref modal) = app.modal else {
+        return;
+    };
 
-    // Dimmed overlay
-    let overlay = Block::default().style(Style::default().bg(color::OVERLAY_BG));
+    let overlay = Block::default().style(Style::default().bg(color::BG));
     frame.render_widget(Clear, area);
     frame.render_widget(overlay, area);
 
-    // Centered modal window
     let modal_area = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(10),
@@ -354,48 +382,61 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(color::ACCENT))
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(color::BG));
 
     let inner = block.inner(modal_area);
     frame.render_widget(Clear, modal_area);
     frame.render_widget(block, modal_area);
 
     match modal {
-        Modal::AddKey { key_name, key_value, step } => {
+        Modal::AddKey {
+            key_name,
+            key_value,
+            step,
+        } => {
             let prompt = match step {
-                AddStep::KeyName => "Enter key name (uppercase):",
+                AddStep::KeyName => "Enter key name (uppercase, underscores):",
                 AddStep::KeyValue => "Enter value:",
             };
             let input_text: String = match step {
-                AddStep::KeyName => key_name.clone(),
+                AddStep::KeyName => {
+                    if key_name.is_empty() {
+                        "\u{25CC} type a name...".to_string()
+                    } else {
+                        key_name.clone()
+                    }
+                }
                 AddStep::KeyValue => {
                     if key_value.is_empty() {
-                        "(type hidden value)".to_string()
+                        "\u{25CC} type a value...".to_string()
                     } else {
-                        "•".repeat(key_value.len())
+                        "\u{2022}".repeat(key_value.len())
                     }
                 }
             };
             let text = Text::from(vec![
                 Line::from(Span::styled(
-                    " Add Secret",
+                    "  Add Secret",
                     Style::default()
                         .fg(color::ACCENT)
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
-                Line::from(Span::styled(prompt, Style::default().fg(Color::White))),
                 Line::from(Span::styled(
-                    format!("  {}█", input_text),
+                    format!("  \u{276F} {prompt}"),
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("    {} \u{2588}", input_text),
                     Style::default().fg(color::BORDER_FOCUS),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    " [Enter] confirm  [Esc] cancel",
+                    "  [Enter] confirm  [Esc] cancel",
                     Style::default().fg(color::TEXT_MUTED),
                 )),
             ]);
-
             let p = Paragraph::new(text);
             frame.render_widget(p, inner);
         }
@@ -403,22 +444,24 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App) {
         Modal::ConfirmDeleteKey { key } => {
             let text = Text::from(vec![
                 Line::from(Span::styled(
-                    " Confirm Delete",
-                    Style::default().fg(color::ERROR).add_modifier(Modifier::BOLD),
+                    "  \u{26A0} Confirm Delete",
+                    Style::default()
+                        .fg(color::ERROR)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!(" Delete key '{}'?", key),
+                    format!("  Delete key '{}'?", key),
                     Style::default().fg(Color::White),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    " This cannot be undone.",
+                    "  This cannot be undone.",
                     Style::default().fg(color::TEXT_MUTED),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    " [y]es  [n]o  [Esc] cancel",
+                    "  [y]es  [n]o  [Esc] cancel",
                     Style::default().fg(color::TEXT_MUTED),
                 )),
             ]);
@@ -429,21 +472,24 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App) {
         Modal::ConfirmDeleteProject { project } => {
             let text = Text::from(vec![
                 Line::from(Span::styled(
-                    " Remove Project",
-                    Style::default().fg(color::ERROR).add_modifier(Modifier::BOLD),
+                    "  \u{26A0} Remove Project",
+                    Style::default()
+                        .fg(color::ERROR)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!(" Remove ALL secrets for '{}'?", project),
+                    format!("  Remove ALL secrets for '{}'?", project),
                     Style::default().fg(Color::White),
                 )),
+                Line::from(""),
                 Line::from(Span::styled(
-                    " This cannot be undone.",
+                    "  This cannot be undone.",
                     Style::default().fg(color::TEXT_MUTED),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    " [y]es  [n]o  [Esc] cancel",
+                    "  [y]es  [n]o  [Esc] cancel",
                     Style::default().fg(color::TEXT_MUTED),
                 )),
             ]);
@@ -459,14 +505,17 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App) {
             };
             let text = Text::from(vec![
                 Line::from(Span::styled(
-                    " ke",
+                    "  \u{2139} ke",
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
-                Line::from(Span::styled(text.as_str(), Style::default().fg(Color::White))),
+                Line::from(Span::styled(
+                    text.as_str(),
+                    Style::default().fg(Color::White),
+                )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    " [Enter] dismiss",
+                    "  [Enter] dismiss",
                     Style::default().fg(color::TEXT_MUTED),
                 )),
             ]);

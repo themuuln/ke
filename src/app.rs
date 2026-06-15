@@ -1,19 +1,36 @@
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::Config;
-use crate::keychain::Keychain;
+use crate::keychain::KeychainBackend;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Focus {
     Projects,
     Keys,
 }
 
 pub enum Modal {
-    AddKey { key_name: String, key_value: String, step: AddStep },
-    ConfirmDeleteKey { key: String },
-    ConfirmDeleteProject { project: String },
-    Message { text: String, level: MsgLevel },
+    AddKey {
+        key_name: String,
+        key_value: String,
+        step: AddStep,
+    },
+    ConfirmDeleteKey {
+        key: String,
+    },
+    ConfirmDeleteProject {
+        project: String,
+    },
+    #[allow(dead_code)]
+    Message {
+        text: String,
+        level: MsgLevel,
+    },
 }
 
 pub enum AddStep {
@@ -28,8 +45,18 @@ pub enum MsgLevel {
     Error,
 }
 
+/// Pre-computed display data for a single key, cached to avoid recomputing
+/// obfuscated strings and formatting on every frame.
+#[derive(Clone)]
+pub struct KeyDisplayItem {
+    pub name: String,
+    pub obfuscated: String,
+    pub full_value: String,
+}
+
 pub struct App {
     pub config: Config,
+    pub keychain: Arc<dyn KeychainBackend>,
     pub projects: Vec<String>,
     pub selected_project: Option<usize>,
     pub selected_key: Option<usize>,
@@ -38,17 +65,25 @@ pub struct App {
     pub key_values: Vec<(String, String)>,
     pub copied: Option<String>,
     pub modal: Option<Modal>,
-    pub project_list_offset: usize,
     pub key_list_offset: usize,
     pub status_msg: Option<(String, MsgLevel)>,
     pub running: bool,
+    /// Pre-computed display items for the current key list. Rebuilt when keys change.
+    pub display_keys: Vec<KeyDisplayItem>,
+    /// Receiver for background value fetches. When switching projects, values load asynchronously.
+    value_rx: Option<Receiver<Vec<(String, String)>>>,
+    /// Project being fetched in the background (to ignore stale results).
+    pending_fetch_project: Option<String>,
+    /// Generation counter bumped on each load_keys. Threads check this to abort early.
+    fetch_gen: Arc<AtomicU64>,
 }
 
 impl App {
-    pub fn new(config: Config) -> anyhow::Result<Self> {
+    pub fn new(config: Config, keychain: Arc<dyn KeychainBackend>) -> anyhow::Result<Self> {
         let projects = config.list_projects()?;
         Ok(Self {
             config,
+            keychain,
             projects,
             selected_project: None,
             selected_key: None,
@@ -57,10 +92,13 @@ impl App {
             key_values: Vec::new(),
             copied: None,
             modal: None,
-            project_list_offset: 0,
             key_list_offset: 0,
             status_msg: None,
             running: true,
+            display_keys: Vec::new(),
+            value_rx: None,
+            pending_fetch_project: None,
+            fetch_gen: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -76,11 +114,97 @@ impl App {
     fn load_keys(&mut self) {
         if let Some(idx) = self.selected_project {
             if idx < self.projects.len() {
-                let project = &self.projects[idx];
-                self.keys = self.config.list_keys(project).unwrap_or_default();
-                self.key_values = Keychain::list_values(project, &self.keys);
+                let project = self.projects[idx].clone();
+
+                // Phase 1 (instant): read key names from config file
+                self.keys = self.config.list_keys(&project).unwrap_or_default();
+                self.key_values = Vec::new();
+                self.pending_fetch_project = Some(project.clone());
+
+                // Build placeholder display — key names only, no values
+                self.display_keys = self
+                    .keys
+                    .iter()
+                    .map(|key| KeyDisplayItem {
+                        name: key.clone(),
+                        obfuscated: String::new(),
+                        full_value: String::new(),
+                    })
+                    .collect();
+
+                // Phase 2 (async): fetch values in background
+                let keys = self.keys.clone();
+                let (tx, rx) = mpsc::channel();
+                self.value_rx = Some(rx);
+                let kc = self.keychain.clone();
+                let gen = self.fetch_gen.clone();
+                let this_gen = gen.fetch_add(1, Ordering::Relaxed) + 1;
+
+                std::thread::spawn(move || {
+                    // Abort early if gen already advanced (user switched away)
+                    if gen.load(Ordering::Relaxed) != this_gen {
+                        return;
+                    }
+                    let values = kc.list_values(&project, &keys);
+                    // Discard if gen changed while we worked
+                    if gen.load(Ordering::Relaxed) == this_gen {
+                        let _ = tx.send(values);
+                    }
+                });
             }
         }
+    }
+
+    /// Whether values are still being fetched in the background for the current project.
+    pub fn is_loading_values(&self) -> bool {
+        self.value_rx.is_some()
+    }
+
+    /// Check if background value fetch completed — called at top of each event loop tick.
+    fn check_value_fetch(&mut self) {
+        let Some(ref rx) = self.value_rx else { return };
+        match rx.try_recv() {
+            Ok(values) => {
+                self.value_rx = None;
+                // Only apply if we're still on the same project
+                let project = self.pending_fetch_project.take();
+                if let Some(ref proj) = project {
+                    if self.selected_project_name() == Some(proj.as_str()) {
+                        self.key_values = values;
+                        self.rebuild_display_cache();
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.value_rx = None;
+                self.pending_fetch_project = None;
+            }
+        }
+    }
+
+    /// Rebuild the pre-computed key display cache for the current project.
+    fn rebuild_display_cache(&mut self) {
+        self.display_keys = self
+            .key_values
+            .iter()
+            .map(|(key, val)| {
+                let obfuscated = if val.len() > 8 {
+                    let mut s = String::with_capacity(11);
+                    s.push_str(&val[..4]);
+                    s.push('…');
+                    s.push_str(&val[val.len() - 4..]);
+                    s
+                } else {
+                    val.clone()
+                };
+                KeyDisplayItem {
+                    name: key.clone(),
+                    obfuscated,
+                    full_value: val.clone(),
+                }
+            })
+            .collect();
     }
 
     /// Refresh the full project list (e.g. after adding a new project).
@@ -96,6 +220,15 @@ impl App {
 
     /// Handle a single event — returns Some to trigger redraw, None to exit.
     pub fn handle_event(&mut self) -> anyhow::Result<bool> {
+        // Check for completed background value fetch before processing events
+        self.check_value_fetch();
+
+        // Use poll with timeout so we can check value fetches even when idle
+        if !event::poll(Duration::from_millis(100))? {
+            // No event ready — still redraw so placeholder -> values transition is visible
+            return Ok(self.running);
+        }
+
         let ev = event::read()?;
 
         // If a modal is open, route to modal handler
@@ -177,8 +310,8 @@ impl App {
                     if idx > 0 {
                         self.selected_key = Some(idx - 1);
                     }
-                } else if !self.key_values.is_empty() {
-                    self.selected_key = Some(self.key_values.len() - 1);
+                } else if !self.display_keys.is_empty() {
+                    self.selected_key = Some(self.display_keys.len() - 1);
                 }
             }
         }
@@ -194,7 +327,7 @@ impl App {
                 }
             }
             Focus::Keys => {
-                let max = self.key_values.len().saturating_sub(1);
+                let max = self.display_keys.len().saturating_sub(1);
                 let next = self.selected_key.map(|i| i + 1).unwrap_or(0);
                 if next <= max {
                     self.selected_key = Some(next);
@@ -207,7 +340,7 @@ impl App {
         match self.focus {
             Focus::Projects => {
                 // Already selected via navigate. Focus keys.
-                if self.selected_project.is_some() && !self.key_values.is_empty() {
+                if self.selected_project.is_some() && !self.display_keys.is_empty() {
                     self.focus = Focus::Keys;
                     self.selected_key = Some(0);
                 }
@@ -220,9 +353,9 @@ impl App {
 
     fn copy_selected(&mut self) {
         let val = match self.focus {
-            Focus::Keys => {
-                self.selected_key.and_then(|i| self.key_values.get(i).map(|(_, v)| v.clone()))
-            }
+            Focus::Keys => self
+                .selected_key
+                .and_then(|i| self.display_keys.get(i).map(|dk| dk.full_value.clone())),
             Focus::Projects => {
                 self.selected_project.and_then(|i| {
                     let _project = &self.projects[i];
@@ -252,8 +385,10 @@ impl App {
         match self.focus {
             Focus::Keys => {
                 if let Some(i) = self.selected_key {
-                    if let Some((key, _)) = self.key_values.get(i) {
-                        self.modal = Some(Modal::ConfirmDeleteKey { key: key.clone() });
+                    if let Some(dk) = self.display_keys.get(i) {
+                        self.modal = Some(Modal::ConfirmDeleteKey {
+                            key: dk.name.clone(),
+                        });
                     }
                 }
             }
@@ -294,14 +429,16 @@ impl App {
     }
 
     fn handle_modal_event(&mut self, ev: Event) {
-        let Some(modal) = self.modal.take() else { return };
+        let Some(modal) = self.modal.take() else {
+            return;
+        };
         let new_modal = match modal {
-            Modal::AddKey { mut key_name, mut key_value, step } => {
-                self.handle_add_key_modal(ev, step, &mut key_name, &mut key_value)
-            }
-            Modal::ConfirmDeleteKey { key } => {
-                self.handle_delete_key_modal(ev, &key)
-            }
+            Modal::AddKey {
+                mut key_name,
+                mut key_value,
+                step,
+            } => self.handle_add_key_modal(ev, step, &mut key_name, &mut key_value),
+            Modal::ConfirmDeleteKey { key } => self.handle_delete_key_modal(ev, &key),
             Modal::ConfirmDeleteProject { project } => {
                 self.handle_delete_project_modal(ev, &project)
             }
@@ -323,13 +460,19 @@ impl App {
         key_name: &mut String,
         key_value: &mut String,
     ) -> Option<Modal> {
-        let Event::Key(ke) = ev else { return Some(Modal::AddKey {
-            key_name: key_name.clone(),
-            key_value: key_value.clone(),
-            step,
-        })};
+        let Event::Key(ke) = ev else {
+            return Some(Modal::AddKey {
+                key_name: std::mem::take(key_name),
+                key_value: std::mem::take(key_value),
+                step,
+            });
+        };
         if ke.kind != KeyEventKind::Press {
-            return Some(Modal::AddKey { key_name: key_name.clone(), key_value: key_value.clone(), step });
+            return Some(Modal::AddKey {
+                key_name: std::mem::take(key_name),
+                key_value: std::mem::take(key_value),
+                step,
+            });
         }
 
         match step {
@@ -340,17 +483,15 @@ impl App {
                             return None; // cancel
                         }
                         return Some(Modal::AddKey {
-                            key_name: key_name.clone(),
+                            key_name: std::mem::take(key_name),
                             key_value: String::new(),
                             step: AddStep::KeyValue,
                         });
                     }
                     KeyCode::Esc => return None,
-                    KeyCode::Char(ch) => {
-                        // Uppercase env-var chars only
-                        if ch.is_alphanumeric() || ch == '_' {
-                            key_name.push(ch.to_ascii_uppercase());
-                        }
+                    // Uppercase env-var chars only
+                    KeyCode::Char(ch) if ch.is_alphanumeric() || ch == '_' => {
+                        key_name.push(ch.to_ascii_uppercase());
                     }
                     KeyCode::Backspace => {
                         key_name.pop();
@@ -358,8 +499,8 @@ impl App {
                     _ => {}
                 }
                 Some(Modal::AddKey {
-                    key_name: key_name.clone(),
-                    key_value: key_value.clone(),
+                    key_name: std::mem::take(key_name),
+                    key_value: std::mem::take(key_value),
                     step,
                 })
             }
@@ -373,7 +514,7 @@ impl App {
                         if let Some(i) = self.selected_project {
                             if i < self.projects.len() {
                                 let project = self.projects[i].clone();
-                                if Keychain::set(&project, key_name, key_value).is_ok() {
+                                if self.keychain.set(&project, key_name, key_value).is_ok() {
                                     let _ = self.config.add_key(&project, key_name);
                                     self.refresh_keys();
                                     self.set_status(
@@ -396,26 +537,32 @@ impl App {
                     }
                     _ => {}
                 }
-                return Some(Modal::AddKey {
-                    key_name: key_name.clone(),
-                    key_value: key_value.clone(),
+                Some(Modal::AddKey {
+                    key_name: std::mem::take(key_name),
+                    key_value: std::mem::take(key_value),
                     step,
-                });
+                })
             }
         }
     }
 
     fn handle_delete_key_modal(&mut self, ev: Event, key: &str) -> Option<Modal> {
-        let Event::Key(ke) = ev else { return Some(Modal::ConfirmDeleteKey { key: key.to_string() }) };
+        let Event::Key(ke) = ev else {
+            return Some(Modal::ConfirmDeleteKey {
+                key: key.to_string(),
+            });
+        };
         if ke.kind != KeyEventKind::Press {
-            return Some(Modal::ConfirmDeleteKey { key: key.to_string() });
+            return Some(Modal::ConfirmDeleteKey {
+                key: key.to_string(),
+            });
         }
         match ke.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 if let Some(i) = self.selected_project {
                     if i < self.projects.len() {
                         let project = &self.projects[i];
-                        let _ = Keychain::delete(project, key);
+                        let _ = self.keychain.delete(project, key);
                         let _ = self.config.remove_key(project, key);
                         self.refresh_keys();
                         self.selected_key = None;
@@ -425,20 +572,28 @@ impl App {
                 None
             }
             KeyCode::Char('n') | KeyCode::Esc => None,
-            _ => Some(Modal::ConfirmDeleteKey { key: key.to_string() }),
+            _ => Some(Modal::ConfirmDeleteKey {
+                key: key.to_string(),
+            }),
         }
     }
 
     fn handle_delete_project_modal(&mut self, ev: Event, project: &str) -> Option<Modal> {
-        let Event::Key(ke) = ev else { return Some(Modal::ConfirmDeleteProject { project: project.to_string() }) };
+        let Event::Key(ke) = ev else {
+            return Some(Modal::ConfirmDeleteProject {
+                project: project.to_string(),
+            });
+        };
         if ke.kind != KeyEventKind::Press {
-            return Some(Modal::ConfirmDeleteProject { project: project.to_string() });
+            return Some(Modal::ConfirmDeleteProject {
+                project: project.to_string(),
+            });
         }
         match ke.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 let keys = self.config.list_keys(project).unwrap_or_default();
                 for key in &keys {
-                    let _ = Keychain::delete(project, key);
+                    let _ = self.keychain.delete(project, key);
                 }
                 let _ = self.config.remove_project(project);
                 self.refresh_projects();
@@ -449,7 +604,9 @@ impl App {
                 None
             }
             KeyCode::Char('n') | KeyCode::Esc => None,
-            _ => Some(Modal::ConfirmDeleteProject { project: project.to_string() }),
+            _ => Some(Modal::ConfirmDeleteProject {
+                project: project.to_string(),
+            }),
         }
     }
 
@@ -461,9 +618,103 @@ impl App {
     pub fn selected_project_name(&self) -> Option<&str> {
         self.selected_project.map(|i| &self.projects[i][..])
     }
+}
 
-    /// Get selected key name.
-    pub fn selected_key_name(&self) -> Option<&str> {
-        self.selected_key.and_then(|i| self.key_values.get(i).map(|(k, _)| k.as_str()))
+// ─── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::keychain::MockKeychain;
+
+    /// Keeps App + TempDir alive so the config directory isn't deleted.
+    struct TestApp {
+        app: App,
+        _dir: tempfile::TempDir,
+    }
+
+    fn test_app() -> TestApp {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = Config::with_index_dir(dir.path().to_path_buf());
+        // Seed a project so the list isn't empty
+        cfg.add_key("myapp", "KEY_A").unwrap();
+        let app = App::new(cfg, Arc::new(MockKeychain::new())).unwrap();
+        TestApp { app, _dir: dir }
+    }
+
+    #[test]
+    fn app_creates_with_project_list() {
+        let ta = test_app();
+        assert_eq!(ta.app.projects, vec!["myapp"]);
+        assert_eq!(ta.app.focus, Focus::Projects);
+        assert!(ta.app.running);
+    }
+
+    #[test]
+    fn app_select_project_loads_keys() {
+        let mut ta = test_app();
+        ta.app.select_project(0);
+        assert_eq!(ta.app.selected_project, Some(0));
+        assert_eq!(ta.app.focus, Focus::Projects); // unchanged by select
+        assert_eq!(ta.app.keys, vec!["KEY_A"]);
+    }
+
+    #[test]
+    fn app_navigate_projects() {
+        let mut ta = test_app();
+        // Add a second project
+        ta.app.config.add_key("another", "X").unwrap();
+        ta.app.refresh_projects();
+
+        assert_eq!(ta.app.projects.len(), 2);
+
+        // Start from no selection, navigate down once -> index 0
+        ta.app.navigate_down();
+        assert_eq!(ta.app.selected_project, Some(0));
+
+        // Navigate down again -> index 1
+        ta.app.navigate_down();
+        assert_eq!(ta.app.selected_project, Some(1));
+
+        // Navigate up -> index 0
+        ta.app.navigate_up();
+        assert_eq!(ta.app.selected_project, Some(0));
+    }
+
+    #[test]
+    fn app_focus_switch() {
+        let mut ta = test_app();
+        ta.app.select_project(0);
+        assert_eq!(ta.app.focus, Focus::Projects);
+
+        // Tab to keys
+        ta.app.focus = Focus::Keys;
+        assert_eq!(ta.app.focus, Focus::Keys);
+
+        // Tab back
+        ta.app.focus = Focus::Projects;
+        assert_eq!(ta.app.focus, Focus::Projects);
+    }
+
+    #[test]
+    fn app_refresh_projects() {
+        let mut ta = test_app();
+        assert_eq!(ta.app.projects.len(), 1);
+
+        ta.app.config.add_key("newproject", "X").unwrap();
+        ta.app.refresh_projects();
+        assert_eq!(ta.app.projects.len(), 2);
+    }
+
+    #[test]
+    fn app_refresh_keys() {
+        let mut ta = test_app();
+        ta.app.select_project(0);
+        assert_eq!(ta.app.keys, vec!["KEY_A"]);
+
+        ta.app.config.add_key("myapp", "KEY_B").unwrap();
+        ta.app.refresh_keys();
+        assert_eq!(ta.app.keys, vec!["KEY_A", "KEY_B"]);
     }
 }

@@ -30,7 +30,19 @@ impl Config {
         let icloud_dir = detect_icloud(&home, &resolved);
 
         fs::create_dir_all(&index_dir)?;
-        Ok(Self { index_dir, icloud_dir })
+        Ok(Self {
+            index_dir,
+            icloud_dir,
+        })
+    }
+
+    /// Create a Config with an explicit index directory (used in tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_index_dir(dir: PathBuf) -> Self {
+        Self {
+            index_dir: dir,
+            icloud_dir: None,
+        }
     }
 
     /// Path to iCloud Drive ke folder (whether or not it exists yet).
@@ -51,8 +63,11 @@ impl Config {
 
     /// Move index from ~/.config/ke to iCloud Drive and symlink back.
     pub fn enable_icloud_sync(&mut self) -> anyhow::Result<()> {
-        let icloud_path = Self::icloud_ke_path()
-            .ok_or_else(|| anyhow::anyhow!("iCloud Drive not found at ~/Library/Mobile Documents/com~apple~CloudDocs"))?;
+        let icloud_path = Self::icloud_ke_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "iCloud Drive not found at ~/Library/Mobile Documents/com~apple~CloudDocs"
+            )
+        })?;
 
         if self.is_icloud_synced() {
             return Ok(()); // already set up
@@ -97,7 +112,11 @@ impl Config {
         let home = home_dir()?;
         let base = home.join(".config");
         for candidate in [base.join(INDEX_DIR), base.join(INDEX_DIR_OLD)] {
-            if candidate.exists() && candidate.is_dir() && !candidate.is_symlink() && candidate != config_path {
+            if candidate.exists()
+                && candidate.is_dir()
+                && !candidate.is_symlink()
+                && candidate != config_path
+            {
                 let cand_backup = candidate.with_extension("ke.bak");
                 let _ = fs::rename(&candidate, &cand_backup);
                 let _ = std::os::unix::fs::symlink(&icloud_path, &candidate);
@@ -111,14 +130,16 @@ impl Config {
     }
 
     /// Return projects with their key status: (project, total_keys, keys_with_values_here).
-    pub fn status(&self) -> anyhow::Result<Vec<(String, usize, usize)>> {
-        use crate::keychain::Keychain;
+    pub fn status(
+        &self,
+        keychain: &dyn crate::keychain::KeychainBackend,
+    ) -> anyhow::Result<Vec<(String, usize, usize)>> {
         let projects = self.list_projects()?;
         let mut results = Vec::new();
         for p in &projects {
             let keys = self.list_keys(p)?;
             let total = keys.len();
-            let have = keys.iter().filter(|k| Keychain::get(p, k).is_some()).count();
+            let have = keys.iter().filter(|k| keychain.get(p, k).is_some()).count();
             results.push((p.clone(), total, have));
         }
         Ok(results)
@@ -217,5 +238,92 @@ fn detect_icloud(home: &Path, resolved_index: &Path) -> Option<PathBuf> {
         Some(icloud_ke)
     } else {
         None
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_config() -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let cfg = Config::with_index_dir(dir.path().to_path_buf());
+        (dir, cfg)
+    }
+
+    #[test]
+    fn empty_project_list() {
+        let (_dir, cfg) = temp_config();
+        assert!(cfg.list_projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_and_list_keys() {
+        let (_dir, cfg) = temp_config();
+        cfg.add_key("myapp", "DB_URL").unwrap();
+        cfg.add_key("myapp", "API_KEY").unwrap();
+
+        let keys = cfg.list_keys("myapp").unwrap();
+        assert_eq!(keys, vec!["API_KEY", "DB_URL"]); // sorted
+    }
+
+    #[test]
+    fn add_key_idempotent() {
+        let (_dir, cfg) = temp_config();
+        cfg.add_key("app", "KEY").unwrap();
+        cfg.add_key("app", "KEY").unwrap(); // duplicate
+
+        let keys = cfg.list_keys("app").unwrap();
+        assert_eq!(keys, vec!["KEY"]);
+    }
+
+    #[test]
+    fn remove_key() {
+        let (_dir, cfg) = temp_config();
+        cfg.add_key("app", "A").unwrap();
+        cfg.add_key("app", "B").unwrap();
+        cfg.remove_key("app", "A").unwrap();
+
+        let keys = cfg.list_keys("app").unwrap();
+        assert_eq!(keys, vec!["B"]);
+    }
+
+    #[test]
+    fn remove_last_key_deletes_project() {
+        let (_dir, cfg) = temp_config();
+        cfg.add_key("app", "ONLY").unwrap();
+        cfg.remove_key("app", "ONLY").unwrap();
+
+        assert!(cfg.list_keys("app").unwrap().is_empty());
+        // Project "file" should be gone
+        assert!(!cfg.index_file("app").exists());
+    }
+
+    #[test]
+    fn remove_project() {
+        let (_dir, cfg) = temp_config();
+        cfg.add_key("app", "K1").unwrap();
+        cfg.add_key("app", "K2").unwrap();
+        cfg.remove_project("app").unwrap();
+
+        assert!(cfg.list_keys("app").unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_projects() {
+        let (_dir, cfg) = temp_config();
+        cfg.add_key("alpha", "K").unwrap();
+        cfg.add_key("beta", "K").unwrap();
+        cfg.add_key("gamma", "K").unwrap();
+
+        let projects = cfg.list_projects().unwrap();
+        assert_eq!(projects, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn service_name_format() {
+        assert_eq!(Config::service_name("myapp"), "keychain-env-myapp");
     }
 }
