@@ -15,7 +15,7 @@ use ratatui::Terminal;
 
 use crate::app::App;
 use crate::config::Config;
-use crate::keychain::RealKeychain;
+use crate::keychain::{KeychainBackend, RealKeychain};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -116,10 +116,78 @@ pub fn validate_key_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("key name cannot be empty".into());
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err("key name must be ASCII alphanumeric or underscore".into());
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err("key name cannot be empty".into());
+    };
+    if !(first.is_ascii_uppercase() || first == '_') {
+        return Err("key name must start with an uppercase ASCII letter or underscore".into());
+    }
+    if !chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+        return Err("key name must be uppercase ASCII alphanumeric or underscore".into());
     }
     Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn dotenv_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn parse_dotenv_value(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        let mut parsed = String::new();
+        let mut chars = trimmed[1..trimmed.len() - 1].chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('n') => parsed.push('\n'),
+                    Some('r') => parsed.push('\r'),
+                    Some('t') => parsed.push('\t'),
+                    Some('\\') => parsed.push('\\'),
+                    Some('"') => parsed.push('"'),
+                    Some(other) => parsed.push(other),
+                    None => parsed.push('\\'),
+                }
+            } else {
+                parsed.push(ch);
+            }
+        }
+        Some(parsed)
+    } else if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        Some(trimmed[1..trimmed.len() - 1].to_string())
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+fn project_values(
+    config: &Config,
+    keychain: &dyn KeychainBackend,
+    project: &str,
+) -> Vec<(String, String)> {
+    let keys = config.list_keys(project).unwrap_or_default();
+    keychain.list_values(project, &keys)
 }
 
 fn print_help() {
@@ -163,25 +231,47 @@ fn print_install() {
 // ═══════════════════════════════════════════════════════════════════════
 
 fn run_tui() -> anyhow::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
-
     let config = Config::load()?;
     let mut app = App::new(config, Arc::new(RealKeychain::new()))?;
-    let res = run_app(&mut terminal, &mut app);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    if let Err(e) = res {
-        eprintln!("Error: {:#}", e);
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(e.into());
     }
-    Ok(())
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(e) => {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            return Err(e.into());
+        }
+    };
+    let res = terminal
+        .clear()
+        .map_err(anyhow::Error::from)
+        .and_then(|_| run_app(&mut terminal, &mut app));
+
+    let mut cleanup_err: Option<anyhow::Error> = None;
+    if let Err(e) = disable_raw_mode() {
+        cleanup_err = Some(e.into());
+    }
+    if let Err(e) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
+        cleanup_err.get_or_insert_with(|| e.into());
+    }
+    if let Err(e) = terminal.show_cursor() {
+        cleanup_err.get_or_insert_with(|| e.into());
+    }
+
+    if let Some(cleanup_err) = cleanup_err {
+        if let Err(e) = res {
+            eprintln!("Error: {:#}", e);
+        }
+        return Err(cleanup_err);
+    }
+    res
 }
 
 fn run_app(
@@ -189,8 +279,14 @@ fn run_app(
     app: &mut App,
 ) -> anyhow::Result<()> {
     terminal.draw(|frame| ui::draw(frame, app))?;
-    while app.handle_event()? {
-        terminal.draw(|frame| ui::draw(frame, app))?;
+    loop {
+        let (running, redraw) = app.handle_event()?;
+        if !running {
+            break;
+        }
+        if redraw {
+            terminal.draw(|frame| ui::draw(frame, app))?;
+        }
     }
     Ok(())
 }
@@ -305,12 +401,10 @@ fn cli_load(args: &[String]) {
         std::process::exit(1);
     }
     let config = Config::load().expect("failed to load config");
-    let keys = config.list_keys(project).unwrap_or_default();
+    let keychain = RealKeychain::new();
     println!("# {project} — from macOS Keychain");
-    for k in &keys {
-        if let Some(v) = keychain::Keychain::get(project, k) {
-            println!("export {k}={v}");
-        }
+    for (key, value) in project_values(&config, &keychain, project) {
+        println!("export {key}={}", shell_quote(&value));
     }
 }
 
@@ -325,12 +419,10 @@ fn cli_cat(args: &[String]) {
         std::process::exit(1);
     }
     let config = Config::load().expect("failed to load config");
-    let keys = config.list_keys(project).unwrap_or_default();
+    let keychain = RealKeychain::new();
     println!("# {project} — from macOS Keychain");
-    for k in &keys {
-        if let Some(v) = keychain::Keychain::get(project, k) {
-            println!("{k}={v}");
-        }
+    for (key, value) in project_values(&config, &keychain, project) {
+        println!("{key}={}", dotenv_quote(&value));
     }
 }
 
@@ -382,11 +474,17 @@ fn cli_delete(args: &[String]) {
         eprintln!("Error: {msg}");
         std::process::exit(1);
     }
-    match keychain::Keychain::delete(project, key) {
+    let delete_res = keychain::Keychain::delete(project, key);
+    match delete_res {
         Ok(()) => {
             let config = Config::load().expect("failed to load config");
             let _ = config.remove_key(project, key);
             eprintln!("Deleted {project}:{key}");
+        }
+        Err(e) if keychain::is_not_found_error(&e) => {
+            let config = Config::load().expect("failed to load config");
+            let _ = config.remove_key(project, key);
+            eprintln!("Removed {project}:{key} from index");
         }
         Err(e) => {
             eprintln!("Error: {e}");
@@ -406,18 +504,16 @@ fn cli_pull(args: &[String]) {
         std::process::exit(1);
     }
     let config = Config::load().expect("failed to load config");
-    let keys = config.list_keys(project).unwrap_or_default();
+    let keychain = RealKeychain::new();
     let out = std::env::current_dir()
         .expect("failed to get current dir")
         .join(".env.local");
     let mut content = format!("# {project} — pulled from Keychain\n");
     content.push_str("# WARNING: contains secrets — never commit!\n\n");
     let mut count = 0;
-    for k in &keys {
-        if let Some(v) = keychain::Keychain::get(project, k) {
-            content.push_str(&format!("{k}={v}\n"));
-            count += 1;
-        }
+    for (key, value) in project_values(&config, &keychain, project) {
+        content.push_str(&format!("{key}={}\n", dotenv_quote(&value)));
+        count += 1;
     }
     std::fs::write(&out, content).expect("failed to write .env.local");
     eprintln!("Wrote {} ({count} secrets)", out.display());
@@ -440,7 +536,9 @@ fn cli_push(args: &[String]) {
     });
 
     let config = Config::load().expect("failed to load config");
+    let keychain = RealKeychain::new();
     let mut count = 0;
+    let mut saved_keys = Vec::new();
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -448,16 +546,19 @@ fn cli_push(args: &[String]) {
         }
         if let Some((key, val)) = line.split_once('=') {
             let key = key.trim();
-            let val = val.trim();
-            if !key.is_empty()
-                && !val.is_empty()
-                && keychain::Keychain::set(project, key, val).is_ok()
-            {
-                let _ = config.add_key(project, key);
+            let Some(val) = parse_dotenv_value(val) else {
+                continue;
+            };
+            if validate_key_name(key).is_err() || val.is_empty() {
+                continue;
+            }
+            if keychain.set(project, key, &val).is_ok() {
+                saved_keys.push(key.to_string());
                 count += 1;
             }
         }
     }
+    let _ = config.add_keys(project, &saved_keys);
     eprintln!("Pushed {count} secrets from {file} into Keychain for '{project}'");
 }
 
@@ -484,7 +585,7 @@ fn cli_run(args: &[String]) {
     }
 
     let config = Config::load().expect("failed to load config");
-    let keys = config.list_keys(project).unwrap_or_default();
+    let keychain = RealKeychain::new();
 
     let mut cmd = std::process::Command::new(cmd_args[cmd_start]);
     for arg in &cmd_args[cmd_start + 1..] {
@@ -492,10 +593,8 @@ fn cli_run(args: &[String]) {
     }
 
     // Set env vars
-    for k in &keys {
-        if let Some(v) = keychain::Keychain::get(project, k) {
-            cmd.env(k, v);
-        }
+    for (key, value) in project_values(&config, &keychain, project) {
+        cmd.env(key, value);
     }
 
     let status = cmd.status().unwrap_or_else(|e| {
@@ -518,8 +617,17 @@ fn cli_rm_project(args: &[String]) {
     }
     let config = Config::load().expect("failed to load config");
     let keys = config.list_keys(project).unwrap_or_default();
+    let mut failed = 0;
     for k in &keys {
-        let _ = keychain::Keychain::delete(project, k);
+        if let Err(e) = keychain::Keychain::delete(project, k) {
+            if !keychain::is_not_found_error(&e) {
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!("Error: failed to delete {failed} secret(s) from Keychain");
+        std::process::exit(1);
     }
     let _ = config.remove_project(project);
     eprintln!("Removed project '{project}'");
@@ -594,5 +702,40 @@ fn cli_status() {
             };
             println!("  {:<18} {:>6} {:>12}", project, total, status);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_names_must_be_valid_env_names() {
+        assert!(validate_key_name("API_KEY_1").is_ok());
+        assert!(validate_key_name("_TOKEN").is_ok());
+        assert!(validate_key_name("1BAD").is_err());
+        assert!(validate_key_name("lower").is_err());
+        assert!(validate_key_name("BAD-NAME").is_err());
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("abc"), "'abc'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn dotenv_quote_escapes_special_chars() {
+        assert_eq!(dotenv_quote("a b"), "\"a b\"");
+        assert_eq!(dotenv_quote("a\"b\\c\n"), "\"a\\\"b\\\\c\\n\"");
+    }
+
+    #[test]
+    fn parse_dotenv_value_decodes_quoted_values() {
+        assert_eq!(
+            parse_dotenv_value("\"a\\\"b\\\\c\\n\""),
+            Some("a\"b\\c\n".into())
+        );
+        assert_eq!(parse_dotenv_value(" leading "), Some(" leading ".into()));
     }
 }

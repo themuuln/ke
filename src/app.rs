@@ -1,12 +1,14 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::Config;
-use crate::keychain::KeychainBackend;
+use crate::keychain::{is_not_found_error, KeychainBackend};
+use crate::validate_key_name;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Focus {
@@ -52,6 +54,8 @@ pub struct KeyDisplayItem {
     pub name: String,
     pub obfuscated: String,
     pub full_value: String,
+    pub preview: String,
+    pub char_count_label: String,
 }
 
 pub struct App {
@@ -115,11 +119,12 @@ impl App {
         if let Some(idx) = self.selected_project {
             if idx < self.projects.len() {
                 let project = self.projects[idx].clone();
+                let this_gen = self.fetch_gen.fetch_add(1, Ordering::Relaxed) + 1;
 
                 // Phase 1 (instant): read key names from config file
                 self.keys = self.config.list_keys(&project).unwrap_or_default();
                 self.key_values = Vec::new();
-                self.pending_fetch_project = Some(project.clone());
+                self.value_rx = None;
 
                 // Build placeholder display — key names only, no values
                 self.display_keys = self
@@ -129,8 +134,17 @@ impl App {
                         name: key.clone(),
                         obfuscated: String::new(),
                         full_value: String::new(),
+                        preview: String::new(),
+                        char_count_label: String::new(),
                     })
                     .collect();
+
+                if self.keys.is_empty() {
+                    self.pending_fetch_project = None;
+                    return;
+                }
+
+                self.pending_fetch_project = Some(project.clone());
 
                 // Phase 2 (async): fetch values in background
                 let keys = self.keys.clone();
@@ -138,7 +152,6 @@ impl App {
                 self.value_rx = Some(rx);
                 let kc = self.keychain.clone();
                 let gen = self.fetch_gen.clone();
-                let this_gen = gen.fetch_add(1, Ordering::Relaxed) + 1;
 
                 std::thread::spawn(move || {
                     // Abort early if gen already advanced (user switched away)
@@ -161,8 +174,10 @@ impl App {
     }
 
     /// Check if background value fetch completed — called at top of each event loop tick.
-    fn check_value_fetch(&mut self) {
-        let Some(ref rx) = self.value_rx else { return };
+    fn check_value_fetch(&mut self) -> bool {
+        let Some(ref rx) = self.value_rx else {
+            return false;
+        };
         match rx.try_recv() {
             Ok(values) => {
                 self.value_rx = None;
@@ -172,36 +187,55 @@ impl App {
                     if self.selected_project_name() == Some(proj.as_str()) {
                         self.key_values = values;
                         self.rebuild_display_cache();
+                        return true;
                     }
                 }
+                false
             }
-            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
                 self.value_rx = None;
                 self.pending_fetch_project = None;
+                false
             }
         }
     }
 
     /// Rebuild the pre-computed key display cache for the current project.
     fn rebuild_display_cache(&mut self) {
-        self.display_keys = self
+        let values_by_key: HashMap<&str, &str> = self
             .key_values
             .iter()
-            .map(|(key, val)| {
-                let obfuscated = if val.len() > 8 {
-                    let mut s = String::with_capacity(11);
-                    s.push_str(&val[..4]);
-                    s.push('…');
-                    s.push_str(&val[val.len() - 4..]);
-                    s
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        self.display_keys = self
+            .keys
+            .iter()
+            .map(|key| {
+                let val = values_by_key.get(key.as_str()).copied().unwrap_or("");
+                let chars: Vec<char> = val.chars().collect();
+                let char_count = chars.len();
+                let obfuscated = if char_count > 8 {
+                    let prefix: String = chars.iter().take(4).copied().collect();
+                    let suffix: String = chars.iter().skip(char_count - 4).copied().collect();
+                    format!("{prefix}…{suffix}")
                 } else {
-                    val.clone()
+                    val.to_string()
+                };
+                let preview = if val.is_empty() {
+                    String::new()
+                } else if char_count > 200 {
+                    let snippet: String = chars.iter().take(200).copied().collect();
+                    format!("  {}...", snippet)
+                } else {
+                    format!("  {}", val)
                 };
                 KeyDisplayItem {
                     name: key.clone(),
                     obfuscated,
-                    full_value: val.clone(),
+                    full_value: val.to_string(),
+                    preview,
+                    char_count_label: format!("  \u{2A} {} chars", char_count),
                 }
             })
             .collect();
@@ -218,15 +252,21 @@ impl App {
         self.load_keys();
     }
 
-    /// Handle a single event — returns Some to trigger redraw, None to exit.
-    pub fn handle_event(&mut self) -> anyhow::Result<bool> {
+    /// Handle a single event — returns (keep_running, needs_redraw).
+    pub fn handle_event(&mut self) -> anyhow::Result<(bool, bool)> {
         // Check for completed background value fetch before processing events
-        self.check_value_fetch();
+        if self.check_value_fetch() {
+            return Ok((self.running, true));
+        }
 
         // Use poll with timeout so we can check value fetches even when idle
-        if !event::poll(Duration::from_millis(100))? {
-            // No event ready — still redraw so placeholder -> values transition is visible
-            return Ok(self.running);
+        let timeout = if self.is_loading_values() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(250)
+        };
+        if !event::poll(timeout)? {
+            return Ok((self.running, false));
         }
 
         let ev = event::read()?;
@@ -234,18 +274,17 @@ impl App {
         // If a modal is open, route to modal handler
         if self.modal.is_some() {
             self.handle_modal_event(ev);
-            return Ok(true);
+            return Ok((self.running, true));
         }
 
         match ev {
             Event::Key(ke) if ke.kind == KeyEventKind::Press => {
                 self.handle_key(ke)?;
+                Ok((self.running, true))
             }
-            Event::Resize(..) => {}
-            _ => {}
+            Event::Resize(..) => Ok((self.running, true)),
+            _ => Ok((self.running, false)),
         }
-
-        Ok(self.running)
     }
 
     fn handle_key(&mut self, ke: KeyEvent) -> anyhow::Result<()> {
@@ -353,9 +392,21 @@ impl App {
 
     fn copy_selected(&mut self) {
         let val = match self.focus {
-            Focus::Keys => self
-                .selected_key
-                .and_then(|i| self.display_keys.get(i).map(|dk| dk.full_value.clone())),
+            Focus::Keys => {
+                let val = self
+                    .selected_key
+                    .and_then(|i| self.display_keys.get(i).map(|dk| dk.full_value.clone()));
+                if val.as_deref() == Some("") {
+                    let msg = if self.is_loading_values() {
+                        "Secret is still loading"
+                    } else {
+                        "Secret value is unavailable"
+                    };
+                    self.set_status(msg, MsgLevel::Error);
+                    return;
+                }
+                val
+            }
             Focus::Projects => {
                 self.selected_project.and_then(|i| {
                     let _project = &self.projects[i];
@@ -482,6 +533,14 @@ impl App {
                         if key_name.is_empty() {
                             return None; // cancel
                         }
+                        if let Err(msg) = validate_key_name(key_name) {
+                            self.set_status(&msg, MsgLevel::Error);
+                            return Some(Modal::AddKey {
+                                key_name: std::mem::take(key_name),
+                                key_value: std::mem::take(key_value),
+                                step,
+                            });
+                        }
                         return Some(Modal::AddKey {
                             key_name: std::mem::take(key_name),
                             key_value: String::new(),
@@ -562,11 +621,23 @@ impl App {
                 if let Some(i) = self.selected_project {
                     if i < self.projects.len() {
                         let project = &self.projects[i];
-                        let _ = self.keychain.delete(project, key);
-                        let _ = self.config.remove_key(project, key);
-                        self.refresh_keys();
-                        self.selected_key = None;
-                        self.set_status(&format!("Deleted {}", key), MsgLevel::Info);
+                        match self.keychain.delete(project, key) {
+                            Ok(()) => {
+                                let _ = self.config.remove_key(project, key);
+                                self.refresh_keys();
+                                self.selected_key = None;
+                                self.set_status(&format!("Deleted {}", key), MsgLevel::Info);
+                            }
+                            Err(e) if is_not_found_error(&e) => {
+                                let _ = self.config.remove_key(project, key);
+                                self.refresh_keys();
+                                self.selected_key = None;
+                                self.set_status(&format!("Removed {}", key), MsgLevel::Info);
+                            }
+                            Err(e) => {
+                                self.set_status(&format!("Delete failed: {}", e), MsgLevel::Error);
+                            }
+                        }
                     }
                 }
                 None
@@ -592,8 +663,20 @@ impl App {
         match ke.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 let keys = self.config.list_keys(project).unwrap_or_default();
+                let mut failed = 0;
                 for key in &keys {
-                    let _ = self.keychain.delete(project, key);
+                    if let Err(e) = self.keychain.delete(project, key) {
+                        if !is_not_found_error(&e) {
+                            failed += 1;
+                        }
+                    }
+                }
+                if failed > 0 {
+                    self.set_status(
+                        &format!("Failed to delete {failed} secret(s)"),
+                        MsgLevel::Error,
+                    );
+                    return None;
                 }
                 let _ = self.config.remove_project(project);
                 self.refresh_projects();
@@ -627,6 +710,8 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::keychain::MockKeychain;
+    use std::thread;
+    use std::time::Duration;
 
     /// Keeps App + TempDir alive so the config directory isn't deleted.
     struct TestApp {
@@ -716,5 +801,32 @@ mod tests {
         ta.app.config.add_key("myapp", "KEY_B").unwrap();
         ta.app.refresh_keys();
         assert_eq!(ta.app.keys, vec!["KEY_A", "KEY_B"]);
+    }
+
+    #[test]
+    fn app_keeps_missing_keys_visible_after_value_fetch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = Config::with_index_dir(dir.path().to_path_buf());
+        cfg.add_key("myapp", "KEY_A").unwrap();
+        cfg.add_key("myapp", "KEY_B").unwrap();
+
+        let mut mock = MockKeychain::new();
+        mock.set_mut("myapp", "KEY_A", "value-a");
+
+        let mut app = App::new(cfg, Arc::new(mock)).unwrap();
+        app.select_project(0);
+
+        for _ in 0..20 {
+            if app.check_value_fetch() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(app.display_keys.len(), 2);
+        assert_eq!(app.display_keys[0].name, "KEY_A");
+        assert_eq!(app.display_keys[0].full_value, "value-a");
+        assert_eq!(app.display_keys[1].name, "KEY_B");
+        assert!(app.display_keys[1].full_value.is_empty());
     }
 }

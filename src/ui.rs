@@ -52,15 +52,13 @@ fn pane_block(title: &str, focused: bool, extra: &str) -> Block<'static> {
         .border_type(BorderType::Rounded)
         .border_style(border_style(focused))
         .title(title_text)
-        .title_style(
-            if focused {
-                Style::default()
-                    .fg(color::BORDER_FOCUS)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(color::TEXT_MUTED)
-            },
-        )
+        .title_style(if focused {
+            Style::default()
+                .fg(color::BORDER_FOCUS)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color::TEXT_MUTED)
+        })
 }
 
 fn count_badge(count: usize) -> Span<'static> {
@@ -76,8 +74,7 @@ fn count_badge(count: usize) -> Span<'static> {
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let chunks =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
+    let chunks = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).split(area);
 
     let main = chunks[0];
     let panes = Layout::horizontal([
@@ -221,20 +218,20 @@ fn draw_preview(frame: &mut Frame, area: Rect, app: &App) {
                 lines.push(Line::from(""));
 
                 let val_preview = if dk.full_value.is_empty() && app.is_loading_values() {
-                    "  loading...".to_string()
+                    None
                 } else if dk.full_value.is_empty() {
-                    "  (empty)".to_string()
-                } else if dk.full_value.len() > 200 {
-                    format!("  {}...", &dk.full_value[..200])
+                    Some("  (empty)")
                 } else {
-                    format!("  {}", dk.full_value)
+                    Some(dk.preview.as_str())
                 };
-                lines.push(Line::from(Span::styled(val_preview, Style::default())));
+                match val_preview {
+                    None => lines.push(Line::from(Span::styled("  loading...", Style::default()))),
+                    Some(text) => lines.push(Line::from(Span::styled(text, Style::default()))),
+                }
                 lines.push(Line::from(""));
 
-                let char_count = dk.full_value.chars().count();
                 lines.push(Line::from(Span::styled(
-                    format!("  \u{2A} {} chars", char_count),
+                    dk.char_count_label.as_str(),
                     Style::default().fg(color::TEXT_MUTED),
                 )));
             }
@@ -343,10 +340,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(" ", Style::default().bg(color::BG)),
         Span::styled(&msg, msg_style.bg(color::BG)),
         Span::styled(" ".repeat(pad), Style::default().bg(color::BG)),
-        Span::styled(
-            &rhs,
-            Style::default().bg(color::BG).fg(color::TEXT_MUTED),
-        ),
+        Span::styled(&rhs, Style::default().bg(color::BG).fg(color::TEXT_MUTED)),
     ]);
 
     let p = Paragraph::new(bar).style(Style::default().bg(color::BG));

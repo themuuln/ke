@@ -7,6 +7,10 @@ use crate::config::Config;
 const SECURITY: &str = "security";
 type CacheKey = (String, String);
 
+pub fn is_not_found_error(error: &anyhow::Error) -> bool {
+    error.to_string().contains("secret not found in Keychain")
+}
+
 /// Backend trait for Keychain operations. Allows swapping the real
 /// macOS Keychain for a mock in tests. Must be `Send + Sync` so it can
 /// be shared with background value-fetch threads.
@@ -32,19 +36,37 @@ impl RealKeychain {
         }
     }
 
-    /// Run a single `security find-generic-password` call for a project+key.
-    fn fetch_from_keychain(project: &str, key: &str) -> Option<String> {
-        let svc = Config::service_name(project);
+    fn decode_security_password(stdout: &[u8]) -> Option<String> {
+        let mut val = String::from_utf8_lossy(stdout).into_owned();
+        if val.ends_with('\n') {
+            val.pop();
+            if val.ends_with('\r') {
+                val.pop();
+            }
+        }
+        if val.is_empty() {
+            None
+        } else {
+            Some(val)
+        }
+    }
+
+    fn fetch_with_service(svc: &str, key: &str) -> Option<String> {
         let output = Command::new(SECURITY)
-            .args(["find-generic-password", "-s", &svc, "-a", key, "-w"])
+            .args(["find-generic-password", "-s", svc, "-a", key, "-w"])
             .output()
             .ok()?;
         if output.status.success() {
-            let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if val.is_empty() { None } else { Some(val) }
+            Self::decode_security_password(&output.stdout)
         } else {
             None
         }
+    }
+
+    /// Run a single `security find-generic-password` call for a project+key.
+    fn fetch_from_keychain(project: &str, key: &str) -> Option<String> {
+        let svc = Config::service_name(project);
+        Self::fetch_with_service(&svc, key)
     }
 }
 
@@ -57,7 +79,10 @@ impl KeychainBackend for RealKeychain {
         }
         // Fetch from Keychain
         if let Some(val) = Self::fetch_from_keychain(project, key) {
-            self.value_cache.lock().unwrap().insert(cache_key, val.clone());
+            self.value_cache
+                .lock()
+                .unwrap()
+                .insert(cache_key, val.clone());
             Some(val)
         } else {
             None
@@ -92,10 +117,10 @@ impl KeychainBackend for RealKeychain {
 
     fn delete(&self, project: &str, key: &str) -> anyhow::Result<()> {
         let svc = Config::service_name(project);
-        let status = Command::new(SECURITY)
+        let output = Command::new(SECURITY)
             .args(["delete-generic-password", "-s", &svc, "-a", key])
-            .status()?;
-        if status.success() {
+            .output()?;
+        if output.status.success() {
             // Invalidate cache
             self.value_cache
                 .lock()
@@ -103,77 +128,84 @@ impl KeychainBackend for RealKeychain {
                 .remove(&(project.to_string(), key.to_string()));
             Ok(())
         } else {
-            Err(anyhow::anyhow!("secret not found in Keychain"))
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("could not be found") || stderr.contains("not be found") {
+                Err(anyhow::anyhow!("secret not found in Keychain"))
+            } else {
+                Err(anyhow::anyhow!(
+                    "failed to delete secret from Keychain: {}",
+                    stderr.trim()
+                ))
+            }
         }
     }
 
     fn list_values(&self, project: &str, keys: &[String]) -> Vec<(String, String)> {
         let svc = Config::service_name(project);
+        let project_key = project.to_string();
+        let mut ordered_values: Vec<Option<String>> = vec![None; keys.len()];
 
         // Phase 1: collect cache hits and uncached keys in one lock acquisition
-        let mut results: Vec<(String, String)> = Vec::with_capacity(keys.len());
-        let mut uncached: Vec<String> = Vec::new();
+        let mut uncached: Vec<(usize, String)> = Vec::new();
         {
             let cache = self.value_cache.lock().unwrap();
-            for key in keys {
-                let ck = (project.to_string(), key.clone());
+            for (idx, key) in keys.iter().enumerate() {
+                let ck = (project_key.clone(), key.clone());
                 if let Some(val) = cache.get(&ck) {
-                    results.push((key.clone(), val.clone()));
+                    ordered_values[idx] = Some(val.clone());
                 } else {
-                    uncached.push(key.clone());
+                    uncached.push((idx, key.clone()));
                 }
             }
         }
 
         // Phase 2: parallel fetch for uncached keys
         if !uncached.is_empty() {
-            let fetched: Vec<(String, String)> = std::thread::scope(|s| {
-                let handles: Vec<_> = uncached
-                    .iter()
-                    .map(|key| {
-                        let k = key.clone();
-                        let svc = svc.clone();
-                        s.spawn(move || {
-                            let output = Command::new(SECURITY)
-                                .args([
-                                    "find-generic-password",
-                                    "-s",
-                                    &svc,
-                                    "-a",
-                                    &k,
-                                    "-w",
-                                ])
-                                .output()
-                                .ok()?;
-                            if output.status.success() {
-                                let val =
-                                    String::from_utf8_lossy(&output.stdout).trim().to_string();
-                                if !val.is_empty() {
-                                    return Some((k, val));
-                                }
+            let worker_count = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(uncached.len());
+            let chunk_size = uncached.len().div_ceil(worker_count);
+            let fetched: Vec<(usize, String, String)> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(worker_count);
+                for chunk in uncached.chunks(chunk_size) {
+                    let chunk = chunk.to_vec();
+                    let svc = svc.clone();
+                    handles.push(s.spawn(move || {
+                        let mut chunk_results = Vec::with_capacity(chunk.len());
+                        for (idx, key) in chunk {
+                            if let Some(val) = Self::fetch_with_service(&svc, &key) {
+                                chunk_results.push((idx, key, val));
                             }
-                            None
-                        })
-                    })
-                    .collect();
+                        }
+                        chunk_results
+                    }));
+                }
 
                 handles
                     .into_iter()
-                    .filter_map(|h| h.join().ok()?)
+                    .flat_map(|h| h.join().unwrap_or_default())
                     .collect()
             });
 
             // Populate cache and results
             if !fetched.is_empty() {
                 let mut cache = self.value_cache.lock().unwrap();
-                for (key, val) in &fetched {
-                    cache.insert((project.to_string(), key.clone()), val.clone());
-                    results.push((key.clone(), val.clone()));
+                for (idx, key, val) in fetched {
+                    cache.insert((project_key.clone(), key), val.clone());
+                    ordered_values[idx] = Some(val);
                 }
             }
         }
 
-        results
+        keys.iter()
+            .enumerate()
+            .filter_map(|(idx, key)| {
+                ordered_values[idx]
+                    .as_ref()
+                    .map(|val| (key.clone(), val.clone()))
+            })
+            .collect()
     }
 }
 

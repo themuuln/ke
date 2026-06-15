@@ -139,7 +139,7 @@ impl Config {
         for p in &projects {
             let keys = self.list_keys(p)?;
             let total = keys.len();
-            let have = keys.iter().filter(|k| keychain.get(p, k).is_some()).count();
+            let have = keychain.list_values(p, &keys).len();
             results.push((p.clone(), total, have));
         }
         Ok(results)
@@ -179,6 +179,15 @@ impl Config {
     pub fn add_key(&self, project: &str, key: &str) -> anyhow::Result<()> {
         let mut keys: BTreeSet<String> = self.list_keys(project)?.into_iter().collect();
         keys.insert(key.to_string());
+        self.write_index(project, &keys.into_iter().collect::<Vec<_>>())
+    }
+
+    pub fn add_keys(&self, project: &str, new_keys: &[String]) -> anyhow::Result<()> {
+        if new_keys.is_empty() {
+            return Ok(());
+        }
+        let mut keys: BTreeSet<String> = self.list_keys(project)?.into_iter().collect();
+        keys.extend(new_keys.iter().cloned());
         self.write_index(project, &keys.into_iter().collect::<Vec<_>>())
     }
 
